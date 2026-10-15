@@ -2,6 +2,7 @@ import type { BrowserScenario } from "../domain/browserScenario.js";
 import type { BrowserScenarioAction } from "../domain/browserScenarioValues.js";
 import type {
   BrowserScenarioEvent,
+  BrowserScenarioEventOmissions,
   BrowserStepArtifacts,
 } from "../domain/browserScenarioCaptureValues.js";
 import type { SanitizedBrowserUrl } from "../domain/browserObservation.js";
@@ -23,6 +24,7 @@ export interface BrowserScenarioSessionPort {
     readonly retained: number;
     readonly dropped: number;
     readonly items: readonly BrowserScenarioEvent[];
+    readonly omissions: BrowserScenarioEventOmissions;
   };
   /** Gaps in selected event families that prevent complete capture claims. */
   eventLimitations?(): readonly string[];
@@ -38,5 +40,8 @@ export interface BrowserScenarioSessionPort {
 /** Acquire one scenario session whose lifecycle the caller owns. */
 export type BrowserScenarioSessionOpener = (
   scenario: BrowserScenario,
-  options: { readonly signal?: AbortSignal },
+  options: {
+    readonly signal?: AbortSignal;
+    readonly retainCleanup?: (close: () => Promise<unknown>) => void;
+  },
 ) => Promise<BrowserScenarioSessionPort>;

@@ -30,6 +30,22 @@ interface Candidate {
   readonly bindings: ReadonlySet<string>;
 }
 
+interface ObjectTargetIndex {
+  readonly propertyByName: ReadonlyMap<
+    string,
+    t.ObjectMethod | t.ObjectProperty
+  >;
+  readonly trailingUnknownsByProperty: ReadonlyMap<
+    t.ObjectMethod | t.ObjectProperty,
+    ObjectTargetUnknown
+  >;
+}
+
+interface ObjectTargetUnknown {
+  readonly node: t.ObjectMethod | t.ObjectProperty | t.SpreadElement;
+  readonly previous: ObjectTargetUnknown | undefined;
+}
+
 /** Resolve local result references conservatively, without claiming call execution. */
 export const createSemanticReturnedReferences = (
   state: JavaScriptSemanticAnalysisState,
@@ -39,6 +55,7 @@ export const createSemanticReturnedReferences = (
   );
   const bindingCache = new Map<string, LocalCallableResolution>();
   const results = new WeakMap<t.Node, readonly SemanticReturnedReference[]>();
+  const objectTargets = new WeakMap<t.ObjectExpression, ObjectTargetIndex>();
   return (callee) => {
     const existing = results.get(callee);
     if (existing !== undefined) return existing;
@@ -57,10 +74,35 @@ export const createSemanticReturnedReferences = (
     const pending: Candidate[] = [
       { node: callee, path: [], bindings: new Set() },
     ];
+    // A shared initializer can be reached through both arms of every alias
+    // diamond. Expand an expression/path again only when its cycle context
+    // permits a binding that an earlier traversal blocked.
+    const expanded = new WeakMap<
+      t.Node,
+      Map<string, readonly ReadonlySet<string>[]>
+    >();
     for (let cursor = 0; cursor < pending.length; cursor++) {
       const item = pending[cursor];
       if (item === undefined) break;
       const node = unwrapJavaScriptExpression(item.node).node;
+      const pathKey = JSON.stringify(item.path);
+      const paths =
+        expanded.get(node) ?? new Map<string, readonly ReadonlySet<string>[]>();
+      const contexts = paths.get(pathKey) ?? [];
+      if (
+        contexts.some((context) =>
+          [...context].every((binding) => item.bindings.has(binding)),
+        )
+      )
+        continue;
+      paths.set(pathKey, [
+        ...contexts.filter(
+          (context) =>
+            ![...item.bindings].every((binding) => context.has(binding)),
+        ),
+        item.bindings,
+      ]);
+      expanded.set(node, paths);
       if (t.isIdentifier(node)) {
         const binding = resolveSemanticBindingState(state, node, node.name);
         if (binding === undefined || item.bindings.has(binding.bindingId))
@@ -115,7 +157,7 @@ export const createSemanticReturnedReferences = (
       } else if (t.isFunction(node) && item.path.length === 0)
         functions.add(node);
       else if (t.isObjectExpression(node))
-        selectObjectTargets(node, item, pending);
+        selectObjectTargets(node, item, pending, objectTargets);
       else if (t.isArrayExpression(node)) {
         const [key, ...path] = item.path;
         const index =
@@ -187,8 +229,38 @@ const selectObjectTargets = (
   node: t.ObjectExpression,
   item: Candidate,
   pending: Candidate[],
+  indexes: WeakMap<t.ObjectExpression, ObjectTargetIndex>,
 ): void => {
   const [key, ...path] = item.path;
+  if (key !== null && key !== undefined) {
+    const index = objectTargetIndex(node, indexes);
+    const property = index.propertyByName.get(String(key));
+    if (property !== undefined) {
+      const unknowns: ObjectTargetUnknown[] = [];
+      for (
+        let unknown = index.trailingUnknownsByProperty.get(property);
+        unknown !== undefined;
+        unknown = unknown.previous
+      )
+        unknowns.push(unknown);
+      for (const { node: unknown } of unknowns.reverse())
+        pending.push({
+          ...item,
+          node: t.isSpreadElement(unknown)
+            ? unknown.argument
+            : t.isObjectProperty(unknown)
+              ? unknown.value
+              : unknown,
+          ...(t.isSpreadElement(unknown) ? {} : { path }),
+        });
+      pending.push({
+        ...item,
+        node: t.isObjectProperty(property) ? property.value : property,
+        path,
+      });
+      return;
+    }
+  }
   let replaced = false;
   for (const property of [...node.properties].reverse()) {
     if (replaced) break;
@@ -210,4 +282,36 @@ const selectObjectTargets = (
     if (key !== null && key !== undefined && name === String(key))
       replaced = true;
   }
+};
+
+const objectTargetIndex = (
+  node: t.ObjectExpression,
+  indexes: WeakMap<t.ObjectExpression, ObjectTargetIndex>,
+): ObjectTargetIndex => {
+  const existing = indexes.get(node);
+  if (existing !== undefined) return existing;
+  const propertyByName = new Map<string, t.ObjectMethod | t.ObjectProperty>();
+  const trailingUnknownsByProperty = new Map<
+    t.ObjectMethod | t.ObjectProperty,
+    ObjectTargetUnknown
+  >();
+  let trailingUnknown: ObjectTargetUnknown | undefined;
+  for (const property of [...node.properties].reverse()) {
+    if (t.isSpreadElement(property)) {
+      trailingUnknown = { node: property, previous: trailingUnknown };
+      continue;
+    }
+    const name = semanticStaticPropertyKey(property.key, property.computed);
+    if (name === null) {
+      trailingUnknown = { node: property, previous: trailingUnknown };
+      continue;
+    }
+    if (propertyByName.has(name)) continue;
+    propertyByName.set(name, property);
+    if (trailingUnknown !== undefined)
+      trailingUnknownsByProperty.set(property, trailingUnknown);
+  }
+  const created = { propertyByName, trailingUnknownsByProperty };
+  indexes.set(node, created);
+  return created;
 };

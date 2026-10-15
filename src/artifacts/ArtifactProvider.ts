@@ -21,22 +21,28 @@ import {
   artifactExtractionExecutionSchema,
   type ArtifactAnalysisOperation,
 } from "../contracts/artifactToolContracts.js";
-import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
+import {
+  isMachOFormat,
+  type BinaryTarget,
+} from "../domain/binaryTargetTypes.js";
 import {
   AnalysisCapabilityUnavailableError,
   AnalysisInputError,
   AnalysisUnsupportedTargetError,
 } from "../domain/analysisErrorCore.js";
 import { ArtifactOperationError } from "../domain/artifactOperationError.js";
-import { type AnalysisError } from "../domain/analysisErrorBase.js";
+import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import { interfaceBuilderLimitsSchema } from "../domain/apple/interfaceBuilderGraph.js";
 import { err, ok, type Result } from "../domain/result.js";
 import { ArtifactReaderFailure } from "./ArtifactReader.js";
+import { ArtifactResourceScope } from "./ArtifactResourceScope.js";
 import { artifactCapabilities } from "./ArtifactProviderMetadata.js";
 import { ARTIFACT_GRAPH_PROVIDER } from "../application/InvestigationProviders.js";
 import { createEvidence } from "../domain/evidence.js";
+import { freezeJsonSnapshot } from "../domain/immutableJson.js";
 import { createArtifactInspection } from "../domain/artifactInspection.js";
+import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 
 /** Read-only inventory and exclusively owned extraction provider. */
 export class ArtifactProvider implements AnalysisProvider {
@@ -67,6 +73,8 @@ export class ArtifactProvider implements AnalysisProvider {
 }
 
 class ArtifactClient implements AnalysisClient {
+  readonly #resourceScope = new ArtifactResourceScope();
+
   constructor(
     private readonly target: BinaryTarget,
     private readonly environment: Readonly<NodeJS.ProcessEnv>,
@@ -183,6 +191,8 @@ class ArtifactClient implements AnalysisClient {
             inputFormat: this.target.format,
             outputRoot: parsed.output_root,
             environment: this.environment,
+            integrityPolicy: parsed.integrity_policy,
+            resourceScope: this.#resourceScope,
           },
           options?.signal,
         );
@@ -219,7 +229,25 @@ class ArtifactClient implements AnalysisClient {
   }
 
   close(): Promise<Result<null, AnalysisError>> {
-    return Promise.resolve(ok(null));
+    return this.#resourceScope.close().then(
+      () => ok(null),
+      (cause: unknown) => {
+        const failure =
+          cause instanceof ArtifactReaderFailure ? cause : undefined;
+        return err(
+          new ProviderCleanupError(
+            ARTIFACT_GRAPH_PROVIDER.id,
+            failure?.cleanup?.resources ?? ["artifact resources"],
+            {
+              reason:
+                failure?.cleanup?.reason ??
+                (cause instanceof Error ? cause.message : String(cause)),
+            },
+            { cause, operation: "close_binary" },
+          ),
+        );
+      },
+    );
   }
 
   /** The active target's kind is outside this operation's supported targets. */
@@ -270,7 +298,7 @@ class ArtifactClient implements AnalysisClient {
     parameters: Readonly<Record<string, JsonValue>>,
     options?: ExecutionOptions,
   ) {
-    if (this.target.kind !== "executable" || this.target.format !== "mach-o")
+    if (this.target.kind !== "executable" || !isMachOFormat(this.target.format))
       throw this.unsupportedTarget(
         "trace_dylib_resolution",
         "trace_dylib_resolution requires an active Mach-O or .app bundle target",
@@ -314,7 +342,11 @@ class ArtifactClient implements AnalysisClient {
       total: 1,
       message: "inventory substep started",
     });
-    const inventory = await this.inventory(inventoryParameters, options);
+    // The freshly parsed inventory is exclusively owned here. Sealing it lets
+    // the nested Evidence share it instead of cloning and re-digesting it.
+    const inventory = freezeJsonSnapshot(
+      await this.inventory(inventoryParameters, options),
+    );
     const subject = subjectFor(
       this.target.sourcePath ?? this.target.path,
       inventory.manifest,
@@ -328,7 +360,10 @@ class ArtifactClient implements AnalysisClient {
       // The nested inventory already names every occurrence's logical path.
       locations: [],
     });
-    const result = createArtifactInspection(inventoryEvidence);
+    // The returned execution and its Evidence then reuse this owned report.
+    const result = freezeJsonSnapshot(
+      createArtifactInspection(inventoryEvidence),
+    );
     await options?.progress?.report({
       phase: "inspect_artifact.inventory",
       completed: 1,
@@ -352,6 +387,7 @@ class ArtifactClient implements AnalysisClient {
     options?: ExecutionOptions,
   ) {
     return inventoryArtifact(this.target.sourcePath ?? this.target.path, {
+      resourceScope: this.#resourceScope,
       environment: this.environment,
       ...(options?.signal === undefined ? {} : { signal: options.signal }),
       integrity: { mode: parsed.integrity_policy },
