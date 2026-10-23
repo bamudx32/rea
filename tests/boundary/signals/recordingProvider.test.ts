@@ -1,8 +1,10 @@
+import { AnalysisResourceConstraintError } from "../../../src/domain/analysisErrorCore.js";
 import { signalDecodersSchema } from "../../../src/domain/signals/signalDecoders.js";
+import { projectAnalysisError } from "../../../src/domain/analysisErrorProjection.js";
 import { OwnedCommandFailure } from "../../../src/process/OwnedCommand.js";
 import { it, expect, onTestFinished } from "vitest";
 import { writeFile, readdir, chmod, symlink } from "node:fs/promises";
-import { join } from "node:path";
+import { extname, join } from "node:path";
 import { readStableArtifact } from "../../../src/artifacts/readStableArtifact.js";
 import { SigrokRecordingProvider } from "../../../src/signals/SigrokRecordingProvider.js";
 import { SignalRecordingService } from "../../../src/application/signals/SignalRecordingService.js";
@@ -14,12 +16,25 @@ import { PrivateRuntimeRoot } from "../../../src/process/PrivateRuntimeRoot.js";
 import { spawnOwnedProviderProcess } from "../../../src/process/ProviderProcess.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { createDeferred } from "../../fixtures/binarySession.js";
+import { analysisErrorRemediationAction } from "../../../src/domain/analysisErrorPresentation.js";
+import { createApplicationMcpHarness } from "../../fixtures/applicationMcpHarness.js";
+import { parseMcpToolError } from "../../fixtures/mcpToolError.js";
+import { Cli } from "incur";
+import { registerSignalCommands } from "../../../src/cli/signalCommands.js";
+import { silentLogger } from "../../../src/logger.js";
 
 // A command-boundary simulator: real process ownership/filesystem, not real sigrok coverage.
 const fixture = async (mode = "ok", failCleanup = false) => {
   const directory = await createTestTempDirectory("rea-signal-test-");
-  const path = join(directory, "recorded bytes.vcd");
-  await writeFile(path, "recording bytes");
+  const path = join(
+    directory,
+    mode === "csv-autodetect" ? "capture.csv" : "recorded bytes.vcd",
+  );
+  const snapshotName = `recording${extname(path)}`;
+  await writeFile(
+    path,
+    mode === "csv-autodetect" ? "CLK,MOSI\n0,0\n1,0\n" : "recording bytes",
+  );
   const script = join(directory, "producer.mjs");
   await writeFile(
     script,
@@ -27,15 +42,21 @@ const fixture = async (mode = "ok", failCleanup = false) => {
 if (process.argv.includes('--version')) { console.log(${JSON.stringify(mode)} === 'bad-version' ? 'sigrok-cli 0.7.1' : 'sigrok-cli 0.7.2\\nlibsigrokdecode 0.5.3'); console.error('version warning'); }
 else if (${JSON.stringify(mode)} === 'bad-version') console.log('unexpected version fallback');
 else if (${JSON.stringify(mode)} === 'nonzero') { console.error('invalid decoder'); process.exitCode = 1; }
-else if (${JSON.stringify(mode)} === 'malformed-copy') { chmodSync('recording', 0o600); writeFileSync('recording', 'changed'); }
-else if (${JSON.stringify(mode)} === 'oversized-copy') { chmodSync('recording', 0o600); truncateSync('recording', 32 * 1024 * 1024 + 1); }
+else if (${JSON.stringify(mode)} === 'unknown-decoder') { console.error("srd: ModuleNotFoundError: Failed to load decoder nosuchdecoder: import by name failed: No module named 'nosuchdecoder'\\nFailed to load protocol decoder nosuchdecoder."); process.exitCode = 1; }
+else if (${JSON.stringify(mode)} === 'broken-decoder') { console.error("srd: ModuleNotFoundError: Failed to load decoder uart: import by name failed: No module named 'serial'\\nFailed to load protocol decoder uart."); process.exitCode = 1; }
+else if (${JSON.stringify(mode)} === 'unknown-annotation') { console.error("Annotation 'nosuchclass' not found for protocol decoder 'uart'."); process.exitCode = 1; }
+else if (${JSON.stringify(mode)} === 'unknown-channel') { process.stdout.write('1000-1105 uart-1: Start bit\\n'); console.error('cli: No channel with name "NONEXISTENT" found.'); }
+else if (${JSON.stringify(mode)} === 'other-channel-warning') { process.stdout.write('1000-1105 uart-1: Start bit\\n'); console.error('cli: No channel with name "OTHER" found.'); }
+else if (${JSON.stringify(mode)} === 'malformed-copy') { chmodSync(${JSON.stringify(snapshotName)}, 0o600); writeFileSync(${JSON.stringify(snapshotName)}, 'changed'); }
+else if (${JSON.stringify(mode)} === 'oversized-copy') { chmodSync(${JSON.stringify(snapshotName)}, 0o600); truncateSync(${JSON.stringify(snapshotName)}, 32 * 1024 * 1024 + 1); }
 else if (${JSON.stringify(mode)} === 'line-budget') process.stdout.write('ID: uart' + '\\n'.repeat(65536));
 else if (${JSON.stringify(mode)} === 'overflow') process.stdout.write('x'.repeat(5 * 1024 * 1024));
 else if (${JSON.stringify(mode)} === 'wait') { console.log('ready'); setInterval(() => {}, 1000); }
 else if (${JSON.stringify(mode)} === 'many') process.stdout.write(Array.from({length:90},(_,i)=>'line '+(i+1)+'\\r\\n').join(''));
 else if (process.argv.includes('--list-supported')) { console.log('Supported hardware drivers:\\n  ignored Device\\nSupported protocol decoders:\\n  uart                 Universal Asynchronous Receiver/Transmitter\\n  i2c                  Inter-Integrated Circuit\\n'); console.error('catalog warning'); }
 else if (process.argv.includes('--show')) console.log('ID: uart\\nOptions:\\n- baudrate: Baud rate (default 115200)\\n- parity: Parity');
-else { if(readFileSync('recording', 'utf8') !== 'recording bytes') throw Error('wrong copy'); console.log('10-20 uart-1: 42'); console.error('producer warning'); }
+else if (${JSON.stringify(mode)} === 'csv-autodetect') { if (!process.argv.includes('--input-file=recording.csv') || readFileSync(${JSON.stringify(snapshotName)}, 'utf8') !== 'CLK,MOSI\\n0,0\\n1,0\\n') throw Error('CSV suffix or copy bytes lost'); console.log('10-20 spi-1: 1'); }
+else { if(readFileSync(${JSON.stringify(snapshotName)}, 'utf8') !== 'recording bytes') throw Error('wrong copy'); console.log('10-20 uart-1: 42'); console.error('producer warning'); }
 `,
   );
   await chmod(script, 0o700);
@@ -93,10 +114,12 @@ else { if(readFileSync('recording', 'utf8') !== 'recording bytes') throw Error('
         await release.promise;
       }
       if (mode === "snapshot-write-failure")
-        await writeFile(join(root.path, "recording"), "already exists");
+        await writeFile(join(root.path, snapshotName), "already exists");
       return {
         path: root.path,
         close: async () => {
+          if (mode === "close-abort")
+            controller.abort({ request: "cancel during workspace close" });
           if (!mayClean) throw new Error("cleanup fixture failure");
           await root.close();
         },
@@ -167,7 +190,7 @@ it("pages literal output without changing decoder arguments or normalizing text"
     expect(report.output_window.returned_lines).toBe(count);
     expect(report.tool.arguments).toEqual([
       "--dont-scan",
-      "--input-file=recording",
+      "--input-file=recording.vcd",
       "--protocol-decoders=uart",
       "--protocol-decoder-samplenum",
     ]);
@@ -210,7 +233,7 @@ it("decodes an immutable copy, preserves options and warnings, and releases its 
   expect(report.selection.input_format).toBeNull();
   expect(report.tool.arguments).toEqual([
     "--dont-scan",
-    "--input-file=recording",
+    "--input-file=recording.vcd",
     "--protocol-decoders=uart:rx=RX:baudrate=9600",
     "--protocol-decoder-samplenum",
     "--protocol-decoder-annotations=uart=rx-data",
@@ -218,6 +241,26 @@ it("decodes an immutable copy, preserves options and warnings, and releases its 
   expect((await readdir(f.directory)).sort()).toEqual([
     "producer.mjs",
     "recorded bytes.vcd",
+  ]);
+});
+
+it("preserves a CSV filename hint through the private autodetection copy", async () => {
+  const f = await fixture("csv-autodetect");
+  const result = await f.service.decode({
+    path: f.path,
+    decoders: "spi:clk=CLK:mosi=MOSI",
+  });
+  if (!result.ok) throw result.error;
+  const report = signalRecordingSchema.parse(result.value.normalized_result);
+  expect(report.selection).toMatchObject({
+    path: f.path,
+    input_format: null,
+  });
+  expect(report.tool.arguments).toEqual([
+    "--dont-scan",
+    "--input-file=recording.csv",
+    "--protocol-decoders=spi:clk=CLK:mosi=MOSI",
+    "--protocol-decoder-samplenum",
   ]);
 });
 
@@ -236,12 +279,237 @@ it.each([
     );
     if (result.ok) throw new Error("Expected decoder failure");
     expect(result.error._tag).toBe(tag);
+    if (mode === "wait")
+      expect(result.error.cause).toBe(f.controller.signal.reason);
     expect(result.error.cleanupIncomplete).toBe(false);
     expect(
       (await readdir(f.directory)).filter((name) =>
         name.startsWith("decoder-"),
       ),
     ).toEqual([]);
+  },
+);
+
+it.each([
+  [
+    "unknown-decoder",
+    { decoders: "uart:rx=RX,nosuchdecoder" },
+    "decoders",
+    "Failed to load protocol decoder nosuchdecoder.",
+  ],
+  [
+    "unknown-annotation",
+    { decoders: "uart", annotations: "uart=rx-data:nosuchclass" },
+    "annotations",
+    "Annotation 'nosuchclass' not found for protocol decoder 'uart'.",
+  ],
+] as const)(
+  "reports sigrok's %s refusal as invalid caller input",
+  async (mode, selection, field, refusal) => {
+    const f = await fixture(mode);
+    const result = await f.service.decode({ path: f.path, ...selection });
+    if (result.ok) throw new Error("Expected selector refusal");
+    expect(result.error._tag).toBe("AnalysisInputError");
+    expect(projectAnalysisError(result.error)).toMatchObject({
+      code: "invalid_request",
+      message: expect.stringContaining("inspect_signal_decoders"),
+      details: {
+        issues: [
+          {
+            path: [field],
+            reason: "invalid_value",
+            message: expect.stringContaining(refusal),
+          },
+        ],
+        captured_output: {
+          exit_code: 1,
+          stderr: expect.stringContaining(refusal),
+        },
+      },
+    });
+    expect(result.error.cleanupIncomplete).toBe(false);
+    expect(
+      (await readdir(f.directory)).filter((name) =>
+        name.startsWith("decoder-"),
+      ),
+    ).toEqual([]);
+  },
+);
+
+it("projects sigrok's zero-exit missing-channel refusal through CLI and MCP with partial output", async () => {
+  const f = await fixture("unknown-channel");
+  const refusal = 'No channel with name "NONEXISTENT" found.';
+  const message = `sigrok-cli rejected the decoders selector: ${refusal}`;
+
+  const harness = await createApplicationMcpHarness({
+    serverOptions: { environment: {}, signalRecording: f.service },
+  });
+  onTestFinished(harness.close);
+  const { error } = parseMcpToolError(
+    await harness.client.callTool({
+      name: "decode_signal_recording",
+      arguments: {
+        path: f.path,
+        decoders: "uart:rx=NONEXISTENT:baudrate=9600",
+      },
+    }),
+  );
+  expect(error).toMatchObject({
+    code: "invalid_request",
+    category: "invalid_input",
+    message: expect.stringContaining(message),
+    details: {
+      issues: [{ path: ["decoders"], reason: "invalid_value" }],
+      captured_output: {
+        exit_code: 0,
+        stdout: "1000-1105 uart-1: Start bit\n",
+        stderr: expect.stringContaining(refusal),
+      },
+    },
+  });
+
+  const cli = Cli.create("signal-channel-refusal-test", { sync: false });
+  registerSignalCommands(cli, silentLogger, {}, f.service);
+  let stdout = "";
+  await cli.serve(
+    [
+      "decode-signal-recording",
+      f.path,
+      "--decoders",
+      "uart:rx=NONEXISTENT:baudrate=9600",
+      "--format",
+      "json",
+    ],
+    {
+      stdout: (text) => {
+        stdout += text;
+      },
+      exit: () => {},
+    },
+  );
+  expect(JSON.parse(stdout)).toMatchObject({
+    code: "invalid_request",
+    details: {
+      issues: [{ path: ["decoders"], reason: "invalid_value" }],
+      captured_output: {
+        exit_code: 0,
+        stdout: "1000-1105 uart-1: Start bit\n",
+        stderr: expect.stringContaining(refusal),
+      },
+    },
+  });
+});
+
+it("does not match channel refusals by substring", async () => {
+  const f = await fixture("other-channel-warning");
+  const result = await f.service.decode({
+    path: f.path,
+    decoders: "uart:rx=RX:baudrate=9600",
+  });
+  expect(result.ok).toBe(true);
+});
+
+it("reports an unknown decoder ID as the rejected field of each MCP operation", async () => {
+  const f = await fixture("unknown-decoder");
+  const harness = await createApplicationMcpHarness({
+    serverOptions: { environment: {}, signalRecording: f.service },
+  });
+  onTestFinished(harness.close);
+  const refusal = "Failed to load protocol decoder nosuchdecoder.";
+  for (const [name, args, field, recovery] of [
+    [
+      "inspect_signal_decoders",
+      { decoder: "nosuchdecoder" },
+      "decoder",
+      "Omit decoder to list installed decoder IDs",
+    ],
+    [
+      "decode_signal_recording",
+      { path: f.path, decoders: "nosuchdecoder" },
+      "decoders",
+      "Use inspect_signal_decoders to list installed decoder IDs",
+    ],
+  ] as const) {
+    const { error } = parseMcpToolError(
+      await harness.client.callTool({ name, arguments: args }),
+    );
+    const message = `sigrok-cli rejected the ${field} selector: ${refusal} ${recovery}`;
+    expect(error).toMatchObject({
+      code: "invalid_request",
+      category: "invalid_input",
+      message: expect.stringContaining(message),
+      recovery: { kind: "inspect_input_contract", operation: name },
+      details: {
+        operation: name,
+        issues: [
+          {
+            path: [field],
+            reason: "invalid_value",
+            message: expect.stringContaining(message),
+          },
+        ],
+        captured_output: {
+          exit_code: 1,
+          stderr: expect.stringContaining(refusal),
+        },
+      },
+    });
+  }
+  expect(
+    (await readdir(f.directory)).filter((name) => name.startsWith("decoder-")),
+  ).toEqual([]);
+});
+
+it("reports an unknown decoder help selection as CLI invalid input", async () => {
+  const f = await fixture("unknown-decoder");
+  const cli = Cli.create("signal-refusal-test", { sync: false });
+  registerSignalCommands(cli, silentLogger, {}, f.service);
+  let stdout = "";
+  await cli.serve(
+    [
+      "inspect-signal-decoders",
+      "--decoder",
+      "nosuchdecoder",
+      "--format",
+      "json",
+    ],
+    {
+      stdout: (text) => {
+        stdout += text;
+      },
+      exit: () => {},
+    },
+  );
+  expect(JSON.parse(stdout)).toMatchObject({
+    code: "invalid_request",
+    message: expect.stringContaining("Omit decoder"),
+    details: {
+      operation: "inspect_signal_decoders",
+      issues: [{ path: ["decoder"], reason: "invalid_value" }],
+      captured_output: { exit_code: 1 },
+    },
+  });
+});
+
+it.each([
+  // An installed decoder whose own dependency is missing is an installation fault.
+  ["broken-decoder", { decoders: "uart" }],
+  ["broken-decoder", { decoder: "uart" }],
+  // Refusals naming selectors the caller did not supply stay unclassified.
+  ["unknown-decoder", { decoders: "uart" }],
+  ["unknown-decoder", { decoder: "uart" }],
+  ["unknown-decoder", {}],
+  ["unknown-annotation", { decoders: "uart", annotations: "uart=rx-data" }],
+] as const)(
+  "keeps %s outside caller selectors %j as a provider failure",
+  async (mode, selection) => {
+    const f = await fixture(mode);
+    const result =
+      "decoders" in selection
+        ? await f.service.decode({ path: f.path, ...selection })
+        : await f.service.inspectDecoders(selection);
+    if (result.ok) throw new Error("Expected decoder failure");
+    expect(result.error._tag).toBe("ProviderAdapterError");
   },
 );
 
@@ -311,7 +579,7 @@ it("retains a completed observation when cancellation arrives at the service bou
       throw new Error("Unexpected discovery call");
     },
     decode: async () => {
-      f.controller.abort();
+      f.controller.abort({ request: "cancel at Evidence boundary" });
       return execution;
     },
     close: async () => {},
@@ -319,6 +587,7 @@ it("retains a completed observation when cancellation arrives at the service bou
   const result = await service.decode(input, { signal: f.controller.signal });
   if (result.ok) throw new Error("Expected late cancellation");
   expect(result.error._tag).toBe("AnalysisCancelledError");
+  expect(result.error.cause).toBe(f.controller.signal.reason);
   expect(result.error.partialObservation).toMatchObject({
     operation: "decode_signal_recording",
     normalized_result: { annotations_text: "10-20 uart-1: 42\n" },
@@ -424,7 +693,7 @@ it.each(["oversized-copy", "oversized-tool"])(
       path:
         mode === "oversized-tool"
           ? join(f.directory, "producer.mjs")
-          : expect.stringMatching(/decoder-.*[/\\]recording$/u),
+          : expect.stringMatching(/decoder-.*[/\\]recording\.vcd$/u),
     });
     expect(
       (await readdir(f.directory)).filter((name) =>
@@ -443,6 +712,9 @@ it("preserves termination signal and effective file ceiling as a resource failur
     reportedLimits: { file_bytes: 1048576 },
     capturedOutput: { signal: "SIGXFSZ", stderr: "before file limit\n" },
   });
+  expect(analysisErrorRemediationAction(result.error)).toContain(
+    "REA retains the tighter inherited limit",
+  );
 });
 
 it("discovers decoders without reading a recording and retains installation provenance", async () => {
@@ -563,6 +835,21 @@ it.each([
       stdout: "sigrok-cli 0.7.1\n",
       stderr: "version warning\n",
     });
+  if (mode === "overflow") {
+    expect(result.error).toBeInstanceOf(AnalysisResourceConstraintError);
+    if (!(result.error instanceof AnalysisResourceConstraintError))
+      throw new Error("Expected command-output allowance refusal");
+    expect(result.error).toMatchObject({
+      resource: "memory",
+      retryable: false,
+    });
+    expect(analysisErrorRemediationAction(result.error)).toContain(
+      "The retained command-output allowance",
+    );
+    expect(analysisErrorRemediationAction(result.error)).not.toMatch(
+      /Review the reported worker memory limits/u,
+    );
+  }
 });
 
 it("retains completed discovery when cleanup fails, then retries before accepting work", async () => {
@@ -575,6 +862,8 @@ it("retains completed discovery when cleanup fails, then retries before acceptin
       partialObservation: { operation: "inspect_signal_decoders" },
     },
   });
+  if (first.ok) throw new Error("expected retained cleanup failure");
+  expect(first.error.cleanupIncomplete).toBe(true);
   await f.service.inspectDecoders({});
   await f.service.decode({ path: f.path, decoders: "uart" });
   expect(f.calls()).toBe(2);
@@ -585,6 +874,7 @@ it("retains completed discovery when cleanup fails, then retries before acceptin
     });
   f.allowCleanup();
   await f.service.close();
+  expect(first.error.cleanupIncomplete).toBe(false);
 });
 
 it("rejects ambiguous decoder selectors before launch and retains malformed help output", async () => {
@@ -623,3 +913,38 @@ it("retains completed discovery on cancellation during identity verification", a
     },
   });
 });
+
+it.each(
+  [false, true].flatMap((failsClose) =>
+    [false, true].map((discovery) => ({ failsClose, discovery })),
+  ),
+)(
+  "retains completed Evidence and exact cancellation during workspace close: %j",
+  async ({ failsClose, discovery }) => {
+    const f = await fixture("close-abort", failsClose);
+    const result = discovery
+      ? await f.service.inspectDecoders({}, { signal: f.controller.signal })
+      : await f.service.decode(
+          { path: f.path, decoders: "uart" },
+          { signal: f.controller.signal },
+        );
+    if (result.ok) throw new Error("Expected finalization cancellation");
+    const primary = failsClose ? result.error.cleanupPrimary : result.error;
+    expect(primary).toMatchObject({ _tag: "AnalysisCancelledError" });
+    expect(primary?.cause).toBe(f.controller.signal.reason);
+    expect(result.error.partialObservation).toMatchObject({
+      operation: discovery
+        ? "inspect_signal_decoders"
+        : "decode_signal_recording",
+    });
+    expect(result.error.cleanupIncomplete).toBe(failsClose);
+    if (failsClose)
+      await expect(f.service.close()).rejects.toMatchObject({
+        cleanupIncomplete: true,
+      });
+    f.allowCleanup();
+    await f.service.close();
+    expect(result.error.cleanupIncomplete).toBe(false);
+    expect(primary?.cause).toBe(f.controller.signal.reason);
+  },
+);

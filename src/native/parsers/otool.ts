@@ -20,6 +20,7 @@ interface ParsedSegment {
 }
 
 interface ParsedLoadCommands {
+  readonly cpuType: number | null;
   readonly commands: Array<{
     index: number;
     kind: string;
@@ -41,6 +42,7 @@ interface ParsedLoadCommands {
   }>;
   uuid: string | null;
   readonly flags: Set<string>;
+  readonly omittedDependencyCommands: string[];
 }
 
 const DYLIB_COMMANDS = new Set([
@@ -51,6 +53,11 @@ const DYLIB_COMMANDS = new Set([
   "LC_LAZY_LOAD_DYLIB",
   "LC_LOAD_UPWARD_DYLIB",
 ]);
+/**
+ * Dependency commands whose install name is not in the otool command text.
+ * `LC_LAZY_LOAD_DYLIB_INFO` stores it in a linkedit payload.
+ */
+const PAYLOAD_DEPENDENCY_COMMANDS = new Set(["LC_LAZY_LOAD_DYLIB_INFO"]);
 
 const DYLIB_FIELDS = [
   "cmd",
@@ -129,7 +136,7 @@ export const parseOtoolLoadCommands = (raw: string) => {
   const header = parseHeader(output);
   if (header === undefined)
     throw new TypeError("otool output is missing the Mach header");
-  const state = createLoadCommandState(header.flags);
+  const state = createLoadCommandState(header.flags, header.cpuType);
   for (const block of output.split(/(?=^Load command \d+$)/mu))
     parseLoadCommand(block, state);
   validateLoadCommandFraming(header, state.commands);
@@ -142,6 +149,7 @@ export const parseOtoolLoadCommands = (raw: string) => {
     commands: state.commands,
     segments: state.segments,
     dependencies: state.dependencies,
+    omittedDependencyCommands: state.omittedDependencyCommands,
     entrypoints: state.entrypoints,
     builds: state.builds,
   };
@@ -257,7 +265,9 @@ const validateLoadCommandFraming = (
 
 const createLoadCommandState = (
   headerFlags: readonly string[] | undefined,
+  cpuType: number | null,
 ): ParsedLoadCommands => ({
+  cpuType,
   commands: [],
   segments: [],
   dependencies: [],
@@ -265,6 +275,7 @@ const createLoadCommandState = (
   builds: [],
   uuid: null,
   flags: new Set(headerFlags ?? []),
+  omittedDependencyCommands: [],
 });
 
 const parseLoadCommand = (block: string, state: ParsedLoadCommands): void => {
@@ -280,6 +291,7 @@ const parseLoadCommand = (block: string, state: ParsedLoadCommands): void => {
   if (kind === null) throw new TypeError("otool load command is missing cmd");
   for (const key of scalarFields(kind)) requireUniqueField(parsed, key);
   if (DYLIB_COMMANDS.has(kind)) validateDylibCommandLines(parsed);
+  if (kind === "LC_LINKER_OPTION") validateLinkerOptionLines(parsed);
   state.commands.push({
     index,
     kind,
@@ -289,12 +301,14 @@ const parseLoadCommand = (block: string, state: ParsedLoadCommands): void => {
   collectEntrypoint(kind, fields, state);
   collectBuild(kind, block, fields, state);
   collectDependency(kind, fields, state);
+  if (PAYLOAD_DEPENDENCY_COMMANDS.has(kind))
+    state.omittedDependencyCommands.push(kind);
   collectSegment(kind, block, fields, state);
 };
 
 const validateDylibCommandLines = (parsed: ParsedFields): void => {
   const encodingFields = DYLIB_ENCODING_FIELDS.filter((key) =>
-    Object.hasOwn(parsed.values, key),
+    parsed.rows.some((field) => field?.[0] === key),
   );
   if (encodingFields.length !== 1)
     throw new TypeError(
@@ -311,9 +325,24 @@ const validateDylibCommandLines = (parsed: ParsedFields): void => {
   }
 };
 
+/** Each declared option appears once, in order, as `string #1..count`. */
+const validateLinkerOptionLines = (parsed: ParsedFields): void => {
+  const count = numberField(parsed.values, "count");
+  const labels = parsed.rows
+    .map((field) => field?.[0])
+    .filter((key) => key !== "cmd" && key !== "cmdsize" && key !== "count");
+  if (
+    count === null ||
+    labels.length !== count ||
+    labels.some((key, index) => key !== `string #${String(index + 1)}`)
+  )
+    throw new TypeError("otool linker-option strings do not match count");
+};
+
 const scalarFields = (kind: string): readonly string[] => {
   const common = ["cmd", "cmdsize"];
   if (DYLIB_COMMANDS.has(kind)) return DYLIB_FIELDS;
+  if (kind === "LC_LINKER_OPTION") return [...common, "count"];
   if (kind === "LC_LOAD_DYLINKER" || kind === "LC_ID_DYLINKER")
     return [...common, "name"];
   if (kind === "LC_UUID") return [...common, "uuid"];
@@ -377,13 +406,33 @@ const collectBuild = (
     });
     return;
   }
-  if (kind.startsWith("LC_VERSION_MIN_"))
+  if (kind.startsWith("LC_VERSION_MIN_")) {
+    const platform = kind.slice("LC_VERSION_MIN_".length) || null;
     state.builds.push({
-      platform: kind.slice("LC_VERSION_MIN_".length) || null,
+      platform: legacySimulatorPlatform(platform, state.cpuType),
       minimum_os: stringField(fields, "version"),
       sdk: stringField(fields, "sdk"),
       tools: [],
     });
+  }
+};
+
+// Apple dyld interprets legacy iOS/tvOS/watchOS minimum-version commands on
+// Intel slices as simulator platforms. Newer commands encode this directly.
+const legacySimulatorPlatform = (
+  platform: string | null,
+  cpuType: number | null,
+): string | null => {
+  if (![7, 0x01000007].includes(cpuType ?? -1)) return platform;
+  return (
+    (
+      {
+        IPHONEOS: "IOSSIMULATOR",
+        TVOS: "TVOSSIMULATOR",
+        WATCHOS: "WATCHOSSIMULATOR",
+      } as const
+    )[platform as "IPHONEOS" | "TVOS" | "WATCHOS"] ?? platform
+  );
 };
 
 const collectDependency = (
@@ -391,7 +440,8 @@ const collectDependency = (
   fields: Readonly<Record<string, string | number | null>>,
   state: ParsedLoadCommands,
 ): void => {
-  if (!DYLIB_COMMANDS.has(kind)) return;
+  // LC_ID_DYLIB names this image itself; it stays a raw load command only.
+  if (!DYLIB_COMMANDS.has(kind) || kind === "LC_ID_DYLIB") return;
   state.dependencies.push({
     path: stripOffsetSuffix(stringField(fields, "name")),
     kind,
@@ -420,27 +470,59 @@ interface ParsedFields {
   readonly rows: readonly (readonly [string, string] | undefined)[];
 }
 
+/**
+ * A key otool prints more than once, such as each LC_BUILD_VERSION tool, is
+ * labeled `key #n` in print order so no row overwrites another. Linker-option
+ * strings keep otool's own `string #n` label at every count.
+ */
 const parseFields = (block: string): ParsedFields => {
-  const fields: Record<string, string | number | null> = {};
   const rows: Array<readonly [string, string] | undefined> = [];
-  for (const rawLine of block.split(/\r?\n/u).slice(1)) {
-    if (rawLine.trim().length === 0) continue;
-    const field = parseField(rawLine);
-    rows.push(field);
+  for (const rawLine of block.split(/\r?\n/u).slice(1))
+    if (rawLine.trim().length > 0) rows.push(parseField(rawLine));
+  const occurrences = new Map<string, number>();
+  for (const field of rows)
+    if (field !== undefined)
+      occurrences.set(field[0], (occurrences.get(field[0]) ?? 0) + 1);
+  const fields: Record<string, string | number | null> = {};
+  const ordinals = new Map<string, number>();
+  for (const field of rows) {
     if (field === undefined) continue;
     const [key, value] = field;
-    fields[key] =
-      key === "segname" || key === "sectname"
-        ? value
-        : (numeric(value) ?? value);
+    const ordinal = (ordinals.get(key) ?? 0) + 1;
+    ordinals.set(key, ordinal);
+    const label =
+      (occurrences.get(key) ?? 0) > 1 ? `${key} #${String(ordinal)}` : key;
+    fields[label] = TEXT_FIELDS.test(key) ? value : (numeric(value) ?? value);
   }
   return { values: fields, rows };
 };
 
+/** Names and linker options are text even when they look numeric. */
+const TEXT_FIELDS = /^(?:segname|sectname|string #\d+)$/u;
+
+/**
+ * otool prints load-command strings as `<key> %s (offset %u)`: exactly one
+ * separator space on each side of the recorded string, whose own leading and
+ * trailing whitespace belongs to the Mach-O value.
+ */
+const OFFSET_STRING_FIELD = /^(name|path) (.* \(offset \d+\))$/u;
+
 const parseField = (rawLine: string): readonly [string, string] | undefined => {
+  const offsetString = OFFSET_STRING_FIELD.exec(rawLine.trimStart());
+  if (offsetString?.[1] !== undefined && offsetString[2] !== undefined)
+    return [offsetString[1], offsetString[2]];
+  // otool prints each linker option as `string #n <option>`; keep the option
+  // exactly, including surrounding spaces, under otool's ordinal label.
+  const option = /^\s*(string #[1-9]\d*)(?: (.*))?$/u.exec(rawLine);
+  if (option?.[1] !== undefined) return [option[1], option[2] ?? ""];
   const line = rawLine.trim();
-  // Match time stamp as a whole without swallowing `name stamp plugin.dylib`.
-  const match = /^((?:time stamp)|\S+(?:\s+version)?)(?:\s+(.+))?$/u.exec(line);
+  // These are the compound field labels used by otool. Keeping this list
+  // explicit prevents a one-word field value such as `sectname version` from
+  // being consumed as an invented `sectname version` key.
+  const match =
+    /^(time stamp|current version|compatibility version|\S+)(?:\s+(.+))?$/u.exec(
+      line,
+    );
   return match?.[1] === undefined
     ? undefined
     : [match[1], match[2]?.trim() ?? ""];
@@ -460,7 +542,7 @@ const parseSegment = (
   block: string,
   fields: Readonly<Record<string, string | number | null>>,
 ): ParsedSegment => ({
-  name: nonEmptyName(stringField(fields, "segname")),
+  name: machoName(fields, "segname"),
   vm_address: hexField(fields, "vmaddr"),
   vm_size: numberField(fields, "vmsize"),
   file_offset: numberField(fields, "fileoff"),
@@ -488,8 +570,8 @@ const parseSections = (block: string): ParsedSection[] =>
       ])
         requireUniqueField(parsed, key);
       return {
-        segment: nonEmptyName(stringField(fields, "segname")),
-        name: nonEmptyName(stringField(fields, "sectname")),
+        segment: machoName(fields, "segname"),
+        name: machoName(fields, "sectname"),
         address: hexField(fields, "addr"),
         size: numberField(fields, "size"),
         file_offset: numberField(fields, "offset"),
@@ -544,9 +626,18 @@ const numeric = (value: string): number | null => {
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 };
 
-/** Project an absent or empty Mach-O name as before: the "unknown" label. */
-const nonEmptyName = (name: string | null): string =>
-  name === null || name.length === 0 ? "unknown" : name;
+/**
+ * A Mach-O segment or section name exactly as observed. Object files place
+ * every section in one unnamed segment, so the empty name is a source value.
+ */
+const machoName = (
+  fields: Readonly<Record<string, string | number | null>>,
+  key: "segname" | "sectname",
+): string => {
+  const name = stringField(fields, key);
+  if (name === null) throw new TypeError(`otool field ${key} is missing`);
+  return name;
+};
 
 const stringField = (
   fields: Readonly<Record<string, string | number | null>>,
@@ -582,7 +673,7 @@ const hexField = (
 };
 
 const stripOffsetSuffix = (value: string | null): string =>
-  value?.replace(/\s+\(offset\s+\d+\)$/u, "") ?? "unknown";
+  value?.replace(/ \(offset \d+\)$/u, "") ?? "unknown";
 
 const sectionAlignment = (raw: string | null): number | null => {
   if (raw === null) return null;
